@@ -1,0 +1,211 @@
+class XXQuoteSocketManager {
+  Map<String, XXSocketModel> modelMap = {};
+  int indexId = 0;
+  socketStatus status = socketStatus.connectedNo;
+  XXWebSocket? webSocket;
+
+  XXQuoteSocketManager() {
+    eventBus.on<EventLogin>().listen((event) {
+      openWebSocket();
+    });
+
+    eventBus.on<EventNetConnectivityState>().listen((event) {
+      openWebSocket();
+    });
+
+    eventBus.on<XXEventTimer>().listen((event) {
+      _timerAction();
+    });
+  }
+
+  void openWebSocket() {
+    try {
+      if (application.isActive == false || netConnectivity.netState == ConnectivityResult.none) {
+        dlog('===== 连接拦截 AppActiveStatus: ${application.isActive} NetState: ${netConnectivity.netState}');
+        return;
+      }
+      if (webSocket != null) {
+        webSocket!.close();
+        webSocket = null;
+      }
+      status = socketStatus.connecting;
+      // dlog("${DateTime.now()} quote socket connecting...\nUrl = ${XXUserInfo.isLogin ? kUQWS_SocketUrl : kQWS_SocketUrl} \n header = $headers");
+      eventBus.fire(EventQuoteSocketState(socketStatus.connecting));
+      String url = kQuoteSocketUrl;
+      if (XXUserInfo.isLogin) {
+        url = '$kUserQuoteSocketUrl?vcode=${XXUserInfo.getVCode()}&cToken=${XXUserInfo.cToken}&clientId=${XXRequestHelper.getClientId()}';
+      }
+
+      Map<String, dynamic> headers = XXRequestHelper.requestHeader(path:url);
+      webSocket = XXWebSocket(url,
+          headers: headers,
+          timeOut: const Duration(seconds: 5),
+          didOpen: didOpen,
+          didClose: didClose,
+          didReceiveMessage: didReceiveMessage,
+          didFailWithError: didFailWithError,
+          cancelOnError: true
+      );
+      dlog('===== 连接中...');
+    } catch (error) {
+      dlog('=========open quote socket error: $error');
+    }
+  }
+
+  sendAllSub() {
+    Map temp = Map.from(modelMap);
+    temp.forEach((key, model) {
+      subMessage(model);
+    });
+  }
+
+  subMessage(XXSocketModel model) {
+
+    if (modelMap.keys.contains(model.t)) {
+      XXSocketModel lastModel = modelMap[model.t]!;
+      cancelMessage(lastModel);
+    }
+
+    modelMap[model.t] = model;
+    Map<String, dynamic> map = {'e': 'sub', 't': model.t};
+    model.id = indexId++;
+    map['id'] = model.id;
+    if (model.ps.isNotEmpty) {
+      map['ps'] = model.ps;
+    }
+    if (status == socketStatus.connectedClosed) return;
+    if (webSocket != null) {
+      model.subTime = DateTime.now().millisecondsSinceEpoch;
+      webSocket!.add(convert.jsonEncode(map));
+    }
+  }
+
+  cancelMessage(XXSocketModel model) {
+
+    if (modelMap.values.contains(model)) {
+      Map<String, dynamic> map = {'e': 'cancel', 't': model.t};
+      if (model.ps.isNotEmpty) {
+        map['ps'] = model.ps;
+      }
+      modelMap.remove(model.t);
+      if (status == socketStatus.connectedClosed) return;
+      if (webSocket != null) {
+        webSocket!.add(convert.jsonEncode(map));
+      }
+    }
+  }
+
+  closeQuoteSocket() async {
+    dlog('===== 连接关闭');
+    status = socketStatus.connectedClosed;
+    if (webSocket != null) {
+      webSocket!.close();
+      webSocket = null;
+    }
+  }
+
+  didOpen() {
+    dlog('===== 连接完成');
+    status = socketStatus.connectedSuccess;
+    eventBus.fire(EventQuoteSocketState(socketStatus.connectedSuccess));
+    sendAllSub();
+  }
+
+  // 连接失败
+  didFailWithError(error) {
+    dlog('===== 连接失败 Error = ${error.toString()}');
+    status = socketStatus.connectedFailed;
+    modelMap.forEach((key, model) {
+      model.httpBlock();
+    });
+    openWebSocket();
+  }
+
+  // 连接中断
+  didClose() {
+    dlog('===== 连接中断');
+    openWebSocket();
+  }
+
+  // 收到服务端推送的消息event
+  didReceiveMessage(data) {
+
+    XXIsolateMessageModel messageModel = XXIsolateMessageModel(
+        type: XXMessageType.socket,
+        params: {
+          'data': data
+        }
+    );
+    kIsolateManager.formatData(messageModel, (resultData) {
+      didReceiveSocketMessage(resultData);
+    });
+
+  }
+
+  void didReceiveSocketMessage(Map jsonMap) {
+    dynamic topic = jsonMap['t'];
+    dynamic dataList = jsonMap['d'];
+    dynamic ping = jsonMap['ping'];
+    dynamic pong = jsonMap['pong'];
+    dynamic id = jsonMap['id'];
+    dynamic co = jsonMap['co'];
+    dynamic ps = jsonMap['ps'];
+
+    if (ping != null) {
+      Map<String, int> pongMap = {'pong': jsonMap['ping']};
+      webSocket?.add(convert.jsonEncode(pongMap));
+    } else if (pong != null) {
+      webSocket?.pingStatus = XXPingStatus.success;
+    } else if (id != null) {
+      XXSocketModel? model = modelMap[topic];
+      if (model == null) {
+        return;
+      }
+      if (co == 0 && model.id == id) {
+        model.subSuccess = true;
+      }
+      if (co != 0) {
+        dlog('quote sub failed = ${jsonMap.toString()}');
+      }
+    } else if (topic != null && dataList != null) {
+      XXSocketModel? model = modelMap[topic];
+      if (model != null && model.subSuccess == true) {
+        if (model.t != 'diffMergedDepth' && model.ps.isNotEmpty) {
+          if (model.ps.toString() != ps.toString()) {
+            dlog('========= ps not equal ${model.ps} $ps $jsonMap');
+            return;
+          }
+        }
+
+        model.f = jsonMap['f'];
+        if (model.successBlock != null) {
+          model.successBlock!(dataList);
+        }
+      }
+    }
+  }
+
+  void _timerAction() {
+
+    if (status != socketStatus.connectedSuccess || webSocket == null) {
+      return;
+    }
+
+    if (webSocket!.pingStatus == XXPingStatus.failed) {
+      dlog('ping 超时了');
+      closeQuoteSocket();
+      openWebSocket();
+    }
+
+    int currentTime = DateTime.now().millisecondsSinceEpoch;
+    for (XXSocketModel model in modelMap.values) {
+      if (model.subSuccess) continue;
+      if (currentTime - model.subTime > 5000) {
+        dlog('订阅超时 == ${model.toString()}');
+        closeQuoteSocket();
+        openWebSocket();
+        break;
+      }
+    }
+  }
+}
